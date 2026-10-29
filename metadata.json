@@ -1,0 +1,6 @@
+{
+  "name": "VentureProbe AI - Startup Intelligence & Validation Platform",
+  "description": "AI research analyst & startup due-diligence platform that conducts dynamic founder interviews, grounds research in real web intelligence, stress-tests assumptions, and delivers contrarian validation reports.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

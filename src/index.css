@@ -1,0 +1,98 @@
+@import "tailwindcss";
+
+@media print {
+  /* Reset page for clean crisp white-paper printing */
+  @page {
+    size: A4 portrait;
+    margin: 14mm 12mm 14mm 12mm;
+  }
+
+  body, html {
+    background: #ffffff !important;
+    color: #0f172a !important;
+    font-size: 11pt !important;
+    line-height: 1.4 !important;
+    -webkit-print-color-adjust: exact !important;
+    print-color-adjust: exact !important;
+  }
+
+  /* Hide interactive navigation, action bars, modals backdrop, and tabs */
+  nav,
+  header,
+  .no-print,
+  button,
+  .print-hide {
+    display: none !important;
+  }
+
+  /* Expand print-only elements */
+  .print-only {
+    display: block !important;
+  }
+
+  /* Container adjustments */
+  .mx-auto {
+    max-width: 100% !important;
+    padding: 0 !important;
+    margin: 0 !important;
+  }
+
+  /* Make dark slate cards high-contrast print white with crisp borders */
+  section,
+  div[class*="bg-slate-900"],
+  div[class*="bg-slate-950"],
+  div[class*="bg-slate-800"] {
+    background: #ffffff !important;
+    color: #0f172a !important;
+    border: 1px solid #cbd5e1 !important;
+    box-shadow: none !important;
+    break-inside: avoid;
+    page-break-inside: avoid;
+  }
+
+  /* Typography adjustments for print readability */
+  h1, h2, h3, h4, h5, h6 {
+    color: #0f172a !important;
+    break-after: avoid;
+    page-break-after: avoid;
+  }
+
+  p, span, li, td, th {
+    color: #1e293b !important;
+  }
+
+  /* Display links cleanly with their destination */
+  a {
+    color: #2563eb !important;
+    text-decoration: underline !important;
+  }
+
+  a[href^="http"]::after {
+    content: " (" attr(href) ")";
+    font-size: 8pt;
+    color: #64748b;
+  }
+
+  /* Clean table borders */
+  table {
+    border-collapse: collapse !important;
+    width: 100% !important;
+  }
+
+  th, td {
+    border: 1px solid #e2e8f0 !important;
+    padding: 6px 8px !important;
+    color: #1e293b !important;
+  }
+
+  th {
+    background-color: #f8fafc !important;
+  }
+
+  /* Badges */
+  span[class*="rounded"] {
+    border: 1px solid #94a3b8 !important;
+    color: #0f172a !important;
+    background: #f1f5f9 !important;
+  }
+}
