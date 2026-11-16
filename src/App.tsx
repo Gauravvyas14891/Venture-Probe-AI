@@ -6,6 +6,7 @@ import { ProfileReviewModal } from './components/ProfileReviewModal';
 import { ResearchProgressView } from './components/ResearchProgressView';
 import { ReportDashboard } from './components/ReportDashboard';
 import { EvidenceDrawer } from './components/EvidenceDrawer';
+import { SAMPLE_RESEARCH_REPORT } from './data/sampleReport';
 import {
   StartupProfile,
   InterviewMessage,
@@ -234,6 +235,7 @@ export default function App() {
         content: data.reply,
         timestamp: new Date().toISOString(),
         suggestedAnswers: data.suggestedAnswers,
+        targetField: data.targetField,
       };
 
       setMessages([...newMessages, assistantMsg]);
@@ -257,6 +259,7 @@ export default function App() {
           'I haven\'t decided yet',
           'Skip this question',
         ],
+        targetField: 'primary_customer',
       };
       setMessages([...newMessages, fallbackMsg]);
       setInterviewStatus('interviewing');
@@ -268,6 +271,8 @@ export default function App() {
   // Step 2: Send reply in interview with Question-Relevance Validation (Rules A to F)
   const handleSendMessage = async (text: string) => {
     if (!text.trim() || isLoading) return;
+
+    const lastAssistantMsg = [...messages].reverse().find((m) => m.role === 'assistant');
 
     const userMsg: InterviewMessage = {
       id: `msg-${Date.now()}`,
@@ -291,6 +296,7 @@ export default function App() {
           rawIdea: originalIdea,
           extractedProfile,
           answeredFields,
+          targetField: lastAssistantMsg?.targetField,
         }),
       });
 
@@ -303,6 +309,7 @@ export default function App() {
         content: data.reply,
         timestamp: new Date().toISOString(),
         suggestedAnswers: data.suggestedAnswers,
+        targetField: data.targetField,
       };
 
       setMessages([...updatedHistory, assistantMsg]);
@@ -361,6 +368,15 @@ export default function App() {
     }
   };
 
+  // Load Sample Report directly for previewing full due-diligence dossier
+  const handleLoadSampleReport = () => {
+    setCurrentProfile(SAMPLE_RESEARCH_REPORT.profile);
+    setReport(SAMPLE_RESEARCH_REPORT);
+    setAppError(null);
+    setStep('report');
+    window.scrollTo({ top: 0, behavior: 'smooth' });
+  };
+
   // Reset to start a new idea
   const handleReset = () => {
     localStorage.removeItem('ventureprobe_interview_state');
@@ -376,18 +392,26 @@ export default function App() {
   };
 
   return (
-    <div className="min-h-screen bg-slate-950 text-slate-100 flex flex-col font-sans selection:bg-indigo-500/30 selection:text-indigo-200">
+    <div
+      className={`min-h-screen flex flex-col font-sans ${
+        step === 'landing'
+          ? 'bg-[#f1f3e6] text-[#000000] selection:bg-[#3f6212]/20 selection:text-[#000000]'
+          : 'bg-slate-950 text-slate-100 selection:bg-indigo-500/30 selection:text-indigo-200'
+      }`}
+    >
       <Navbar
         currentStep={step}
         onReset={handleReset}
         hasActiveReport={!!report}
         onViewReport={() => report && setStep('report')}
+        onLoadSampleReport={handleLoadSampleReport}
       />
 
       <main className="flex-1">
         {step === 'landing' && (
           <LandingHero
             onStartInterview={handleStartInterview}
+            onLoadSampleReport={handleLoadSampleReport}
           />
         )}
 

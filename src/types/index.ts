@@ -166,6 +166,7 @@ export interface InterviewMessage {
   readinessSnapshot?: ReadinessGate;
   profileSnapshot?: Partial<StartupProfile>;
   suggestedAnswers?: string[];
+  targetField?: string;
 }
 
 export type SourceTier =

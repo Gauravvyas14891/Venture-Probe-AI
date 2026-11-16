@@ -1,4 +1,4 @@
-import { GoogleGenAI, Type } from '@google/genai';
+import { GoogleGenAI, Type, ThinkingLevel } from '@google/genai';
 import {
   ExtractedStartupProfile,
   ExtractedFieldItem,
@@ -9,19 +9,21 @@ import {
   QuestionValidationResult,
 } from '../src/types';
 
-// Initialize Gemini client on server
-const ai = process.env.GEMINI_API_KEY
-  ? new GoogleGenAI({
-      apiKey: process.env.GEMINI_API_KEY,
-      httpOptions: {
-        headers: {
-          'User-Agent': 'aistudio-build',
-        },
+// Lazy Gemini client initializer on server so dotenv/injected env vars are always available
+function getAiClient(): GoogleGenAI | null {
+  const apiKey = process.env.GEMINI_API_KEY;
+  if (!apiKey) return null;
+  return new GoogleGenAI({
+    apiKey,
+    httpOptions: {
+      headers: {
+        'User-Agent': 'aistudio-build',
       },
-    })
-  : null;
+    },
+  });
+}
 
-function withTimeout<T>(promise: Promise<T>, ms: number = 4000): Promise<T> {
+function withTimeout<T>(promise: Promise<T>, ms: number = 20000): Promise<T> {
   return Promise.race([
     promise,
     new Promise<T>((_, reject) =>
@@ -95,12 +97,20 @@ export function createBlankExtractedProfile(): ExtractedStartupProfile {
  * - Assign explicit, inferred, ambiguous, or missing
  * - Detect contradictions (e.g. conflicting target customer)
  */
+export interface GeminiInterviewQuestionSeed {
+  openingInsight?: string;
+  firstTargetField?: string;
+  firstQuestion?: string;
+  suggestedAnswers?: string[];
+}
+
 export async function extractInitialIdeaProfile(
   rawIdea: string
 ): Promise<{
   extractedProfile: ExtractedStartupProfile;
   canonicalLock: BusinessIdentityLock;
   flaggedContradictions: string[];
+  geminiSeed?: GeminiInterviewQuestionSeed;
 }> {
   const cleanedIdea = (rawIdea || '').trim();
   const baseProfile = createBlankExtractedProfile();
@@ -109,90 +119,181 @@ export async function extractInitialIdeaProfile(
     return fallbackDeterministicExtraction(cleanedIdea);
   }
 
-  // If Gemini is available, run structured information extraction
-  if (ai && cleanedIdea.length > 5) {
+  const ai = getAiClient();
+  // If Gemini is available, run structured information extraction & segregation
+  if (ai && cleanedIdea.length > 3) {
     try {
-      const extractionPrompt = `You are the VentureProbe Information Extraction & Venture Architecture Engine.
-Analyze the user's complete startup description and extract explicitly provided information into a structured 23-dimension profile.
+      const fieldListDescription = REQUIRED_23_FIELDS.map(
+        (f) => `- ${f.name} (${f.label}, priority ${f.priority}): ${f.description}`
+      ).join('\n');
+
+      const extractionPrompt = `Analyze the founder's COMPLETE startup description below. Read every sentence, paragraph, bullet point, example, and informal detail carefully.
 
 ORIGINAL STARTUP DESCRIPTION:
 """
 ${cleanedIdea}
 """
 
-CRITICAL EXTRACTION RULES:
-1. READ THE ENTIRE DESCRIPTION: Analyze all paragraphs, bullet points, examples, and text regardless of position. Do NOT just read the beginning.
-2. NEVER INVENT ANSWERS: Only populate a field when the description provides supporting information. If the user did not mention pricing, leave pricing null and status "missing". If they didn't mention geography, leave geography null and status "missing". DO NOT guess!
-3. STATUS LABELS:
-   - "explicit": Directly stated by the user. Must quote the exact supporting phrase in "evidence".
-   - "inferred": Strongly implied by context, but not directly stated.
-   - "ambiguous": The description contains conflicting or unclear information.
-   - "missing": No supporting information exists in the text.
-4. CONTRADICTIONS: Check if the text contradicts itself (e.g., target customer is 'individual consumers' in paragraph 1 but 'enterprise B2B companies' later). If so, set status "ambiguous" and explain in "contradiction_notes".
-5. EXTRACT INTO THESE EXACT 23 FIELDS:
-   - startup_idea, problem, proposed_solution, primary_customer, secondary_customer, customer_pain_points,
-     features, geography, industry_category, business_model, revenue_streams, pricing, direct_competitors,
-     indirect_competitors, value_proposition, competitive_advantage, acquisition_channels,
-     operational_requirements, technology_requirements, legal_regulatory, founder_assumptions, known_risks, unknown_information.
+23 CANONICAL FIELDS TO SEGREGATE:
+${fieldListDescription}
 
-Respond ONLY with valid JSON in this schema:
-{
-  "fields": [
-    {
-      "field_name": "string",
-      "value": "string or null",
-      "status": "explicit" | "inferred" | "ambiguous" | "missing",
-      "evidence": "exact supporting phrase from user text, or null",
-      "confidence": 0.0 to 1.0,
-      "needs_confirmation": boolean,
-      "notes": "string or null"
-    }
-  ],
-  "contradictions": ["string description of any conflicting statements"]
-}`;
+STRICT ANALYSIS & SEGREGATION RULES:
+1. READ THE ENTIRE INPUT: Extract information from anywhere in the text (beginning, middle, or end). Segregate distinct concepts into the exact matching field(s) instead of dumping everything into one field.
+2. NEVER INVENT UNSTATED FACTS: Only populate a field when the user text genuinely supports it. If pricing, geography, competitors, or any other dimension is NOT mentioned or strongly implied, set value to null, status to "missing", and evidence to null.
+3. STATUS DEFINITIONS:
+   - "explicit": Directly stated in the text. Put the exact supporting quote/phrase from the user text in "evidence" and synthesize a clean concise summary in "value".
+   - "inferred": Strongly and unambiguously implied by context (set needs_confirmation: true).
+   - "ambiguous": Contradictory or conflicting details exist in the text (e.g. consumer vs enterprise mismatch). Explain the contradiction in "notes" and add it to "contradictions".
+   - "missing": Not stated in the text.
+4. CANONICAL IDENTITY: Derive an accurate canonicalProductName, productCategory, and productType matching the founder's actual product (never alter the business model).
+5. TAILORED OPENING ANALYST STEP:
+   - Write "openingInsight": 2 concise, sharp sentences showing you accurately understood the core mechanics, customer, and differentiation of THIS specific startup idea.
+   - Choose "firstTargetField": the SINGLE highest-priority field among ["primary_customer", "problem", "proposed_solution", "geography", "business_model", "revenue_streams", "direct_competitors", "value_proposition", "pricing"] whose extracted status is "ambiguous" or "missing" (NEVER pick a field whose status is "explicit"). If all essential dimensions are already explicit, pick the most critical priority-3/4 field or set firstQuestion to "INTERVIEW_COMPLETE".
+   - Write "firstQuestion": ONE focused, plain-English question specifically tailored to this startup idea targeting firstTargetField (no multi-part questions).
+   - Provide "suggestedAnswers": 3 realistic, domain-specific options tailored specifically to THIS startup idea (not generic boilerplate).`;
 
       const generatePromise = ai.models.generateContent({
-        model: 'gemini-3.8-flash',
+        model: 'gemini-4-hydrogen',
         contents: extractionPrompt,
         config: {
+          systemInstruction:
+            'You are VentureProbe AI, a senior venture capital analyst. You strictly segregate startup ideas into verified facts vs gaps without hallucinating missing details.',
+          thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
           responseMimeType: 'application/json',
+          responseSchema: {
+            type: Type.OBJECT,
+            properties: {
+              canonicalProductName: { type: Type.STRING },
+              productCategory: { type: Type.STRING },
+              productType: {
+                type: Type.STRING,
+                description:
+                  'One of: Peer-to-Peer Marketplace / Cost-Sharing, Commercial Marketplace, B2B SaaS / Workflow Software, B2C Mobile App / Consumer Platform, On-Demand Service / Dispatch, Staffing / Agency Services, Hardware / Physical Product, E-Commerce / D2C, Hybrid / Other',
+              },
+              fields: {
+                type: Type.ARRAY,
+                items: {
+                  type: Type.OBJECT,
+                  properties: {
+                    field_name: { type: Type.STRING },
+                    value: { type: Type.STRING, nullable: true },
+                    status: { type: Type.STRING },
+                    evidence: { type: Type.STRING, nullable: true },
+                    confidence: { type: Type.NUMBER },
+                    needs_confirmation: { type: Type.BOOLEAN },
+                    notes: { type: Type.STRING, nullable: true },
+                  },
+                  required: ['field_name', 'status', 'confidence', 'needs_confirmation'],
+                },
+              },
+              contradictions: {
+                type: Type.ARRAY,
+                items: { type: Type.STRING },
+              },
+              openingInsight: { type: Type.STRING },
+              firstTargetField: { type: Type.STRING },
+              firstQuestion: { type: Type.STRING },
+              suggestedAnswers: {
+                type: Type.ARRAY,
+                items: { type: Type.STRING },
+              },
+            },
+            required: ['fields', 'contradictions', 'openingInsight', 'firstTargetField', 'firstQuestion', 'suggestedAnswers'],
+          },
         },
       });
 
-      const res = await withTimeout(generatePromise, 4000);
-
+      const res = await withTimeout(generatePromise, 25000);
       const text = res.text?.trim() || '{}';
       const parsed = JSON.parse(text);
 
       if (parsed.fields && Array.isArray(parsed.fields)) {
         for (const item of parsed.fields) {
           if (item && item.field_name && baseProfile[item.field_name]) {
+            const rawStatus = String(item.status || '').toLowerCase();
+            const hasVal = typeof item.value === 'string' && item.value.trim().length > 0 && item.value.trim().toLowerCase() !== 'null';
             const status: FieldExtractionStatus =
-              ['explicit', 'inferred', 'ambiguous', 'missing'].includes(item.status)
-                ? item.status
-                : item.value
+              rawStatus === 'explicit' || rawStatus === 'inferred' || rawStatus === 'ambiguous' || rawStatus === 'missing'
+                ? (rawStatus as FieldExtractionStatus)
+                : hasVal
                 ? 'explicit'
                 : 'missing';
 
+            const cleanedValue = hasVal ? item.value.trim() : null;
+            const effectiveStatus: FieldExtractionStatus = cleanedValue ? status : 'missing';
+
             baseProfile[item.field_name] = {
               ...baseProfile[item.field_name],
-              value: item.value || null,
-              status,
-              evidence: item.evidence || null,
-              confidence: typeof item.confidence === 'number' ? Math.max(0, Math.min(1, item.confidence)) : (status === 'explicit' ? 0.95 : 0.5),
-              needs_confirmation: !!item.needs_confirmation || status === 'ambiguous',
-              source: status === 'explicit' ? 'original_idea' : (status === 'inferred' ? 'inferred' : 'unknown'),
-              explanation: item.notes || undefined,
+              value: cleanedValue,
+              status: effectiveStatus,
+              evidence: item.evidence && String(item.evidence).trim().toLowerCase() !== 'null' ? String(item.evidence).trim() : null,
+              confidence:
+                typeof item.confidence === 'number'
+                  ? Math.max(0, Math.min(1, item.confidence))
+                  : effectiveStatus === 'explicit'
+                  ? 0.95
+                  : effectiveStatus === 'inferred'
+                  ? 0.72
+                  : 0,
+              needs_confirmation: !!item.needs_confirmation || effectiveStatus === 'ambiguous' || effectiveStatus === 'inferred',
+              source: effectiveStatus === 'explicit' ? 'original_idea' : effectiveStatus === 'inferred' ? 'inferred' : 'unknown',
+              explanation: item.notes && String(item.notes).trim().toLowerCase() !== 'null' ? String(item.notes).trim() : undefined,
             };
           }
         }
 
-        const contradictions = Array.isArray(parsed.contradictions) ? parsed.contradictions : [];
+        // Ensure startup_idea is always populated from the founder's submitted brief
+        if (!baseProfile.startup_idea.value) {
+          baseProfile.startup_idea = {
+            ...baseProfile.startup_idea,
+            value: cleanedIdea,
+            status: 'explicit',
+            evidence: cleanedIdea.slice(0, 220),
+            confidence: 0.99,
+            needs_confirmation: false,
+            source: 'original_idea',
+          };
+        }
+
+        const contradictions = Array.isArray(parsed.contradictions) ? parsed.contradictions.filter(Boolean) : [];
         const canonicalLock = buildCanonicalLockFromExtracted(cleanedIdea, baseProfile, contradictions);
-        return { extractedProfile: baseProfile, canonicalLock, flaggedContradictions: contradictions };
+        if (parsed.canonicalProductName && typeof parsed.canonicalProductName === 'string') {
+          canonicalLock.canonicalProductName = parsed.canonicalProductName.trim();
+        }
+        if (parsed.productCategory && typeof parsed.productCategory === 'string') {
+          canonicalLock.productCategory = parsed.productCategory.trim();
+        }
+        const validProductTypes: BusinessIdentityLock['productType'][] = [
+          'Peer-to-Peer Marketplace / Cost-Sharing',
+          'Commercial Marketplace',
+          'B2B SaaS / Workflow Software',
+          'B2C Mobile App / Consumer Platform',
+          'On-Demand Service / Dispatch',
+          'Staffing / Agency Services',
+          'Hardware / Physical Product',
+          'E-Commerce / D2C',
+          'Hybrid / Other',
+        ];
+        if (validProductTypes.includes(parsed.productType)) {
+          canonicalLock.productType = parsed.productType;
+        }
+
+        return {
+          extractedProfile: baseProfile,
+          canonicalLock,
+          flaggedContradictions: contradictions,
+          geminiSeed: {
+            openingInsight: parsed.openingInsight,
+            firstTargetField: parsed.firstTargetField,
+            firstQuestion: parsed.firstQuestion,
+            suggestedAnswers: Array.isArray(parsed.suggestedAnswers) ? parsed.suggestedAnswers : [],
+          },
+        };
       }
-    } catch (err) {
-      console.warn('Gemini extraction failed, using deterministic semantic extractor fallback:', err);
+    } catch (err: any) {
+      console.error('Gemini extraction failed, using deterministic semantic extractor fallback:', err?.message || err);
+      const fb = fallbackDeterministicExtraction(cleanedIdea);
+      return { ...fb, geminiSeed: { openingInsight: undefined }, engineError: err?.message || String(err) } as any;
     }
   }
 
@@ -1194,10 +1295,138 @@ export function calculateReadinessFromExtracted(
 }
 
 /**
+ * Maps all 23 extracted dimensions consistently into StartupProfile fields.
+ */
+function syncExtractedToStartupProfile(
+  rawIdea: string,
+  extractedProfile: ExtractedStartupProfile,
+  canonicalLock: BusinessIdentityLock,
+  baseProfile?: Partial<StartupProfile>
+): StartupProfile {
+  const strVal = (name: string): string => {
+    const v = extractedProfile[name]?.value;
+    if (!v) return '';
+    return Array.isArray(v) ? v.join('; ') : String(v).trim();
+  };
+
+  const listVal = (name: string): string[] => {
+    const v = extractedProfile[name]?.value;
+    if (!v) return [];
+    if (Array.isArray(v)) return v.map((s) => String(s).trim()).filter(Boolean);
+    return String(v)
+      .split(/[;,\n]+/)
+      .map((s) => s.trim())
+      .filter(Boolean);
+  };
+
+  const featuresList = listVal('features');
+  const primaryCustomer = strVal('primary_customer');
+  const geo = strVal('geography');
+  const revModel = strVal('revenue_streams') || strVal('business_model');
+  const pricing = strVal('pricing');
+  const customerLower = primaryCustomer.toLowerCase();
+  const isB2B =
+    canonicalLock.productType?.includes('B2B') ||
+    customerLower.includes('b2b') ||
+    customerLower.includes('compan') ||
+    customerLower.includes('business') ||
+    customerLower.includes('enterprise') ||
+    customerLower.includes('agenc') ||
+    customerLower.includes('team') ||
+    customerLower.includes('clinic');
+
+  return {
+    ...(baseProfile as StartupProfile),
+    startupName: canonicalLock.canonicalProductName || baseProfile?.startupName || 'Untitled Venture',
+    oneLiner: strVal('value_proposition') || strVal('startup_idea').slice(0, 160) || baseProfile?.oneLiner || 'Startup Thesis',
+    detailedDescription: rawIdea || baseProfile?.detailedDescription || '',
+    problemBeingSolved: strVal('problem') || baseProfile?.problemBeingSolved || '',
+    proposedSolution: strVal('proposed_solution') || baseProfile?.proposedSolution || '',
+    whyFounderBelievesProblemExists: strVal('customer_pain_points') || baseProfile?.whyFounderBelievesProblemExists || '',
+    primaryCustomer: primaryCustomer || baseProfile?.primaryCustomer || '',
+    secondaryCustomer: strVal('secondary_customer') || baseProfile?.secondaryCustomer || '',
+    customerModel: canonicalLock.productType?.includes('Marketplace') ? 'Marketplace' : isB2B ? 'B2B' : 'B2C',
+    customerDemographics: primaryCustomer || baseProfile?.customerDemographics || '',
+    customerGeography: geo || baseProfile?.customerGeography || '',
+    customerIndustry: strVal('industry_category') || baseProfile?.customerIndustry || '',
+    customerSegment: primaryCustomer || baseProfile?.customerSegment || '',
+    buyerPersona: primaryCustomer || baseProfile?.buyerPersona || '',
+    endUserPersona: primaryCustomer || baseProfile?.endUserPersona || '',
+    decisionMaker: primaryCustomer || baseProfile?.decisionMaker || '',
+    problemDescription: strVal('problem') || baseProfile?.problemDescription || '',
+    problemFrequency: baseProfile?.problemFrequency || 'Frequent Friction',
+    problemSeverity: baseProfile?.problemSeverity || 'Critical & Urgent',
+    currentWorkaround: strVal('indirect_competitors') || baseProfile?.currentWorkaround || 'Manual workarounds and fragmented status-quo methods',
+    existingAlternatives: strVal('indirect_competitors') || baseProfile?.existingAlternatives || '',
+    costOfProblem: strVal('customer_pain_points') || baseProfile?.costOfProblem || '',
+    emotionalFriction: strVal('customer_pain_points') || baseProfile?.emotionalFriction || '',
+    isUrgentOrOptional: baseProfile?.isUrgentOrOptional || 'Urgent',
+    productOrService: strVal('proposed_solution') || baseProfile?.productOrService || '',
+    mainFeatures: featuresList.length > 0 ? featuresList : baseProfile?.mainFeatures || ['Core MVP Solution'],
+    userJourneySummary: strVal('proposed_solution') || baseProfile?.userJourneySummary || '',
+    valueProposition: strVal('value_proposition') || baseProfile?.valueProposition || '',
+    differentiation: strVal('competitive_advantage') || baseProfile?.differentiation || '',
+    whyUsersWouldSwitch: strVal('value_proposition') || baseProfile?.whyUsersWouldSwitch || '',
+    whyUsersMightNotSwitch: strVal('known_risks') || baseProfile?.whyUsersMightNotSwitch || '',
+    revenueModel: revModel || baseProfile?.revenueModel || '',
+    pricingAssumption: pricing || baseProfile?.pricingAssumption || '',
+    pricingStructure: (pricing.toLowerCase().includes('free')
+      ? 'Freemium'
+      : revModel.toLowerCase().includes('commission') || revModel.toLowerCase().includes('take-rate')
+      ? 'Commission'
+      : revModel.toLowerCase().includes('transaction')
+      ? 'Transaction Fee'
+      : revModel.toLowerCase().includes('usage')
+      ? 'Usage-based'
+      : 'Subscription') as StartupProfile['pricingStructure'],
+    whoPays: primaryCustomer || baseProfile?.whoPays || '',
+    paymentFrequency: baseProfile?.paymentFrequency || 'Monthly',
+    initialCountry: geo || baseProfile?.initialCountry || '',
+    targetGeography: geo || baseProfile?.targetGeography || '',
+    potentialInternationalMarkets: baseProfile?.potentialInternationalMarkets || [],
+    industryCategory: strVal('industry_category') || baseProfile?.industryCategory || 'Technology',
+    marketSizeAssumptions: baseProfile?.marketSizeAssumptions || '',
+    growthAssumptions: baseProfile?.growthAssumptions || '',
+    knownCompetitors: listVal('direct_competitors').length > 0 ? listVal('direct_competitors') : baseProfile?.knownCompetitors || [],
+    indirectCompetitors: listVal('indirect_competitors').length > 0 ? listVal('indirect_competitors') : baseProfile?.indirectCompetitors || [],
+    currentAlternatives: listVal('indirect_competitors').length > 0 ? listVal('indirect_competitors') : baseProfile?.currentAlternatives || [],
+    whyExistingInsufficient: strVal('problem') || baseProfile?.whyExistingInsufficient || '',
+    discoveryChannels: listVal('acquisition_channels').length > 0 ? listVal('acquisition_channels') : baseProfile?.discoveryChannels || [],
+    salesModel: isB2B ? 'B2B Direct / Outbound' : 'Self-Serve / Digital',
+    distributionPartnerships: baseProfile?.distributionPartnerships || [],
+    communityAcquisition: strVal('acquisition_channels') || baseProfile?.communityAcquisition || '',
+    moatType: strVal('competitive_advantage') || baseProfile?.moatType || 'Product Differentiation',
+    technologyAdvantage: strVal('technology_requirements') || baseProfile?.technologyAdvantage || '',
+    distributionAdvantage: strVal('acquisition_channels') || baseProfile?.distributionAdvantage || '',
+    dataAdvantage: baseProfile?.dataAdvantage || '',
+    networkEffects: baseProfile?.networkEffects || '',
+    costAdvantage: baseProfile?.costAdvantage || '',
+    regulatoryAdvantage: baseProfile?.regulatoryAdvantage || '',
+    founderAdvantage: baseProfile?.founderAdvantage || '',
+    humanInvolvementRequired: strVal('operational_requirements') || baseProfile?.humanInvolvementRequired || '',
+    logisticsRequirements: strVal('operational_requirements') || baseProfile?.logisticsRequirements || '',
+    verificationProcess: baseProfile?.verificationProcess || '',
+    customerSupportNeeds: baseProfile?.customerSupportNeeds || '',
+    supplySideRequirements: strVal('operational_requirements') || baseProfile?.supplySideRequirements || '',
+    operationalRisks: listVal('known_risks').length > 0 ? listVal('known_risks') : baseProfile?.operationalRisks || [],
+    regulatedAreas: listVal('legal_regulatory').length > 0 ? listVal('legal_regulatory') : baseProfile?.regulatedAreas || [],
+    requiresProfessionalLegalCounsel: listVal('legal_regulatory').length > 0 || !!baseProfile?.requiresProfessionalLegalCounsel,
+    regulatoryNotes: strVal('legal_regulatory') || baseProfile?.regulatoryNotes || '',
+    regulatoryDisclaimer: 'Informational analysis only. Not legal or financial advice.',
+    founderStatedAssumptions:
+      listVal('founder_assumptions').length > 0
+        ? listVal('founder_assumptions')
+        : baseProfile?.founderStatedAssumptions || ['Customers willing to switch from current workaround'],
+    aiInferredAssumptions: listVal('unknown_information').length > 0 ? listVal('unknown_information') : baseProfile?.aiInferredAssumptions || [],
+    businessIdentityLock: canonicalLock,
+  };
+}
+
+/**
  * High-level orchestration for Step 1 & 2:
- * Captures the original idea, analyzes the complete description across 23 fields,
+ * Captures the original idea, analyzes the complete description across 23 fields via Gemini,
  * tracks evidence for every field, initializes the canonical business lock,
- * and formulates the initial analyst response.
+ * and formulates the initial tailored analyst response.
  */
 export async function handleInterviewExtraction(
   rawIdea: string,
@@ -1214,12 +1443,14 @@ export async function handleInterviewExtraction(
     suggestedAnswers: string[];
     isComplete: boolean;
   };
+  targetField: string;
   answeredFields: string[];
   suggestedAnswers: string[];
   isComplete: boolean;
 }> {
-  const { extractedProfile, canonicalLock, flaggedContradictions } =
-    await extractInitialIdeaProfile(rawIdea);
+  const extractionResult = await extractInitialIdeaProfile(rawIdea);
+  const { extractedProfile, canonicalLock, flaggedContradictions, geminiSeed } = extractionResult;
+  const engineError = (extractionResult as any).engineError;
 
   const answeredFields: string[] = [];
   for (const field of REQUIRED_23_FIELDS) {
@@ -1229,103 +1460,37 @@ export async function handleInterviewExtraction(
     }
   }
 
-  // Generate the first question respecting Rule A (Never ask for what is already explicitly stated)
-  const nextQ = generatePrioritizedQuestion(
-    rawIdea,
-    extractedProfile,
-    [],
-    answeredFields
-  );
+  // Prefer Gemini's domain-specific first question if it passes Question-Relevance Rules A–F
+  let nextQ = generatePrioritizedQuestion(rawIdea, extractedProfile, [], answeredFields);
+  if (
+    geminiSeed?.firstQuestion &&
+    geminiSeed.firstQuestion !== 'INTERVIEW_COMPLETE' &&
+    geminiSeed.firstTargetField &&
+    extractedProfile[geminiSeed.firstTargetField]
+  ) {
+    const validation = validateQuestionRelevance(
+      geminiSeed.firstQuestion,
+      geminiSeed.firstTargetField,
+      rawIdea,
+      extractedProfile,
+      [],
+      answeredFields
+    );
+    if (validation.isValid) {
+      const customOpts = Array.isArray(geminiSeed.suggestedAnswers)
+        ? geminiSeed.suggestedAnswers.filter((s) => typeof s === 'string' && s.trim().length > 0).slice(0, 4)
+        : [];
+      nextQ = {
+        question: geminiSeed.firstQuestion.trim(),
+        targetField: geminiSeed.firstTargetField,
+        suggestedAnswers: customOpts.length > 0 ? customOpts : nextQ.suggestedAnswers,
+        isComplete: false,
+      };
+    }
+  }
 
   const readiness = calculateReadinessFromExtracted(extractedProfile);
-
-  // Map into StartupProfile structure
-  const startupProfile: StartupProfile = {
-    startupName: canonicalLock.canonicalProductName || 'Untitled Venture',
-    oneLiner: (extractedProfile.value_proposition?.value as string) || (extractedProfile.startup_idea?.value as string)?.slice(0, 160) || 'Startup Thesis',
-    detailedDescription: rawIdea,
-    problemBeingSolved: (extractedProfile.problem?.value as string) || '',
-    proposedSolution: (extractedProfile.proposed_solution?.value as string) || '',
-    whyFounderBelievesProblemExists: (extractedProfile.customer_pain_points?.value as string) || '',
-    primaryCustomer: (extractedProfile.primary_customer?.value as string) || '',
-    secondaryCustomer: (extractedProfile.secondary_customer?.value as string) || '',
-    customerModel: (canonicalLock.productType?.includes('B2B') || canonicalLock.primaryPayingCustomer?.toLowerCase().includes('b2b') || canonicalLock.primaryPayingCustomer?.toLowerCase().includes('companies')) ? 'B2B' : 'B2C',
-    customerDemographics: (extractedProfile.primary_customer?.value as string) || '',
-    customerGeography: (extractedProfile.geography?.value as string) || '',
-    customerIndustry: (extractedProfile.industry_category?.value as string) || '',
-    customerSegment: (extractedProfile.primary_customer?.value as string) || '',
-    buyerPersona: (extractedProfile.primary_customer?.value as string) || '',
-    endUserPersona: (extractedProfile.primary_customer?.value as string) || '',
-    decisionMaker: (extractedProfile.primary_customer?.value as string) || '',
-    problemDescription: (extractedProfile.problem?.value as string) || '',
-    problemFrequency: 'Frequent Friction',
-    problemSeverity: 'Critical & Urgent',
-    currentWorkaround: (extractedProfile.indirect_competitors?.value as string) || 'Manual workarounds and fragmented status-quo methods',
-    existingAlternatives: (extractedProfile.indirect_competitors?.value as string) || '',
-    costOfProblem: (extractedProfile.customer_pain_points?.value as string) || '',
-    emotionalFriction: (extractedProfile.customer_pain_points?.value as string) || '',
-    isUrgentOrOptional: 'Urgent',
-    productOrService: (extractedProfile.proposed_solution?.value as string) || '',
-    mainFeatures: extractedProfile.features?.value
-      ? (Array.isArray(extractedProfile.features.value)
-          ? extractedProfile.features.value
-          : (extractedProfile.features.value as string).split(';').map((s) => s.trim()).filter(Boolean))
-      : ['Core MVP Solution'],
-    userJourneySummary: '',
-    valueProposition: (extractedProfile.value_proposition?.value as string) || '',
-    differentiation: (extractedProfile.competitive_advantage?.value as string) || '',
-    whyUsersWouldSwitch: (extractedProfile.value_proposition?.value as string) || '',
-    whyUsersMightNotSwitch: '',
-    revenueModel: (extractedProfile.revenue_streams?.value as string) || (extractedProfile.business_model?.value as string) || '',
-    pricingAssumption: (extractedProfile.pricing?.value as string) || '',
-    pricingStructure: (extractedProfile.pricing?.value ? 'Freemium' : 'Subscription') as any,
-    whoPays: (extractedProfile.primary_customer?.value as string) || '',
-    paymentFrequency: 'Monthly',
-    initialCountry: (extractedProfile.geography?.value as string) || '',
-    targetGeography: (extractedProfile.geography?.value as string) || '',
-    potentialInternationalMarkets: [],
-    industryCategory: (extractedProfile.industry_category?.value as string) || 'Technology',
-    marketSizeAssumptions: '',
-    growthAssumptions: '',
-    knownCompetitors: extractedProfile.direct_competitors?.value
-      ? [extractedProfile.direct_competitors.value as string]
-      : [],
-    indirectCompetitors: extractedProfile.indirect_competitors?.value
-      ? [extractedProfile.indirect_competitors.value as string]
-      : [],
-    currentAlternatives: [],
-    whyExistingInsufficient: '',
-    discoveryChannels: extractedProfile.acquisition_channels?.value
-      ? [extractedProfile.acquisition_channels.value as string]
-      : [],
-    salesModel: 'Direct / Digital',
-    distributionPartnerships: [],
-    communityAcquisition: '',
-    moatType: (extractedProfile.competitive_advantage?.value as string) || 'Product Differentiation',
-    technologyAdvantage: (extractedProfile.technology_requirements?.value as string) || '',
-    distributionAdvantage: '',
-    dataAdvantage: '',
-    networkEffects: '',
-    costAdvantage: '',
-    regulatoryAdvantage: '',
-    founderAdvantage: '',
-    humanInvolvementRequired: '',
-    logisticsRequirements: '',
-    verificationProcess: '',
-    customerSupportNeeds: '',
-    supplySideRequirements: '',
-    operationalRisks: [],
-    regulatedAreas: extractedProfile.legal_regulatory?.value ? [extractedProfile.legal_regulatory.value as string] : [],
-    requiresProfessionalLegalCounsel: false,
-    regulatoryNotes: (extractedProfile.legal_regulatory?.value as string) || '',
-    regulatoryDisclaimer: 'Informational analysis only. Not legal or financial advice.',
-    founderStatedAssumptions: extractedProfile.founder_assumptions?.value
-      ? [extractedProfile.founder_assumptions.value as string]
-      : ['Customers willing to switch from current workaround'],
-    aiInferredAssumptions: [],
-    businessIdentityLock: canonicalLock,
-    ...(existingProfile || {}),
-  };
+  const startupProfile = syncExtractedToStartupProfile(rawIdea, extractedProfile, canonicalLock, existingProfile);
 
   // Build the rich analyst reply summarizing explicitly captured information
   const explicitItems = REQUIRED_23_FIELDS.filter((f) => {
@@ -1333,17 +1498,21 @@ export async function handleInterviewExtraction(
     return item && item.status === 'explicit' && item.value;
   });
 
-  const explicitSummaryLines = explicitItems.slice(0, 5).map((f) => {
+  const explicitSummaryLines = explicitItems.slice(0, 6).map((f) => {
     const item = extractedProfile[f.name];
     const valStr = typeof item.value === 'string' ? item.value : JSON.stringify(item.value);
-    const snippet = valStr.length > 90 ? valStr.slice(0, 90) + '...' : valStr;
+    const snippet = valStr.length > 100 ? valStr.slice(0, 100) + '...' : valStr;
     return `• **${f.label}**: "${snippet}"`;
   });
 
   let replyText = `🔒 **Venture Profile Extracted & Locked**: ${canonicalLock.canonicalProductName}\n\n`;
 
+  if (geminiSeed?.openingInsight) {
+    replyText += `${geminiSeed.openingInsight.trim()}\n\n`;
+  }
+
   if (explicitItems.length > 0) {
-    replyText += `I analyzed your complete startup brief across 23 dimensions. The following points were explicitly detected from your original text with verified evidence:\n${explicitSummaryLines.join('\n')}\n\n`;
+    replyText += `Captured **${explicitItems.length}/23 dimensions** directly from your brief:\n${explicitSummaryLines.join('\n')}\n\n`;
   }
 
   if (flaggedContradictions.length > 0) {
@@ -1363,17 +1532,238 @@ export async function handleInterviewExtraction(
     canonicalLock,
     readiness,
     nextQuestion: nextQ,
+    targetField: nextQ.targetField,
     answeredFields,
     suggestedAnswers: nextQ.suggestedAnswers,
     isComplete: nextQ.isComplete,
+    ...(engineError ? { engineError } : {}),
   };
 }
 
 /**
+ * Gemini-powered analyst interview step:
+ * Uses Gemini to deeply analyze the user's reply in the context of their original idea,
+ * segregate insights across ALL relevant 23 dimensions, evaluate readiness,
+ * and formulate a sharp, idea-specific next question + tailored options.
+ */
+async function processInterviewStepWithGemini(
+  rawIdea: string,
+  userMessage: string,
+  history: Array<{ role: string; content: string }>,
+  workingExtracted: ExtractedStartupProfile,
+  workingAnswered: string[],
+  targetField: string
+): Promise<{
+  updatedExtracted: ExtractedStartupProfile;
+  updatedAnswered: string[];
+  answerAnalysis: string;
+  nextQuestion: {
+    question: string;
+    targetField: string;
+    suggestedAnswers: string[];
+    isComplete: boolean;
+  };
+} | null> {
+  if (process.env.TEST_MODE === '1') return null;
+  const ai = getAiClient();
+  if (!ai) return null;
+
+  try {
+    const currentSnapshot = REQUIRED_23_FIELDS.map((f) => {
+      const item = workingExtracted[f.name];
+      const status = item?.user_skipped ? 'user_skipped' : item?.status || 'missing';
+      return `- ${f.name} (${f.label}, p${f.priority}): status=${status}, value=${item?.value ? JSON.stringify(item.value) : 'null'}`;
+    }).join('\n');
+
+    const recentTurns = history
+      .slice(-6)
+      .map((m) => `${m.role.toUpperCase()}: ${m.content}`)
+      .join('\n\n');
+
+    const prompt = `You are VentureProbe AI, a skeptical senior startup analyst interviewing a founder.
+
+ORIGINAL STARTUP IDEA:
+"""
+${rawIdea}
+"""
+
+CURRENT 23-DIMENSION PROFILE STATE:
+${currentSnapshot}
+
+RECENT CONVERSATION:
+${recentTurns}
+
+LAST QUESTION TARGET FIELD: ${targetField}
+FOUNDER'S LATEST ANSWER:
+"""
+${userMessage}
+"""
+
+INSTRUCTIONS:
+1. ANALYZE & SEGREGATE THE ANSWER ACCURATELY:
+   - Read the founder's latest answer in full context of their startup idea.
+   - If the user said "skip", "I haven't decided", "I don't know", or similar for ${targetField}, set user_skipped=true, status="missing", value=null for ${targetField}.
+   - Otherwise, segregate EVERY dimension among the 23 canonical fields that the founder's latest answer explicitly informs, clarifies, or updates (e.g., if they mention customer + city + pricing in one answer, output separate entries in "updatedFields" for primary_customer, geography, and pricing!).
+   - Never fabricate details the user didn't state. Preserve existing explicit fields unless the founder explicitly refined or corrected them.
+2. WRITE "answerAnalysis":
+   - Write 1–2 concise, insightful analyst sentences accurately reflecting what the founder just told you and how it sharpens the venture model (e.g., unit economics, segment clarity, or operational implications for THIS specific startup).
+3. DECIDE READINESS & NEXT QUESTION:
+   - Check remaining fields whose status is "missing" or "ambiguous" and NOT user_skipped and NOT in [${workingAnswered.join(', ')}].
+   - Priority order: (1) unresolved "ambiguous" contradictions, (2) Priority 1 core gaps (primary_customer, problem, proposed_solution, geography), (3) Priority 3 gaps (business_model, revenue_streams, direct_competitors, indirect_competitors, features, value_proposition), (4) max 1–2 Priority 4 gaps if total assistant turns < 4.
+   - If essential gaps are satisfied (or >= 6 core checkpoints resolved and no major ambiguities remain), set isInterviewComplete=true and nextQuestion="INTERVIEW_COMPLETE".
+   - Otherwise, pick "nextTargetField" (a single genuinely missing or ambiguous field — NEVER an already explicit or skipped field), write ONE sharp, single-focus, idea-specific "nextQuestion", and provide 3 realistic, domain-tailored "suggestedAnswers" specifically relevant to THIS startup idea.`;
+
+    const res = await withTimeout(
+      ai.models.generateContent({
+        model: 'gemini-4-hydrogen',
+        contents: prompt,
+        config: {
+          systemInstruction:
+            'You are VentureProbe AI, a disciplined venture due-diligence analyst. Always segregate user answers into exact canonical fields, never re-ask explicit facts, and tailor questions strictly to the founder’s real startup idea.',
+          thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
+          responseMimeType: 'application/json',
+          responseSchema: {
+            type: Type.OBJECT,
+            properties: {
+              updatedFields: {
+                type: Type.ARRAY,
+                items: {
+                  type: Type.OBJECT,
+                  properties: {
+                    field_name: { type: Type.STRING },
+                    value: { type: Type.STRING, nullable: true },
+                    status: { type: Type.STRING },
+                    evidence: { type: Type.STRING, nullable: true },
+                    user_skipped: { type: Type.BOOLEAN },
+                    notes: { type: Type.STRING, nullable: true },
+                  },
+                  required: ['field_name', 'status', 'user_skipped'],
+                },
+              },
+              answerAnalysis: { type: Type.STRING },
+              isInterviewComplete: { type: Type.BOOLEAN },
+              nextTargetField: { type: Type.STRING },
+              nextQuestion: { type: Type.STRING },
+              suggestedAnswers: {
+                type: Type.ARRAY,
+                items: { type: Type.STRING },
+              },
+            },
+            required: ['updatedFields', 'answerAnalysis', 'isInterviewComplete', 'nextTargetField', 'nextQuestion', 'suggestedAnswers'],
+          },
+        },
+      }),
+      25000
+    );
+
+    const parsed = JSON.parse(res.text?.trim() || '{}');
+    const newExtracted: ExtractedStartupProfile = { ...workingExtracted };
+    const newlyHandledFields = new Set<string>(workingAnswered);
+    if (targetField) newlyHandledFields.add(targetField);
+
+    if (Array.isArray(parsed.updatedFields)) {
+      for (const upd of parsed.updatedFields) {
+        if (!upd || !upd.field_name || !newExtracted[upd.field_name]) continue;
+        newlyHandledFields.add(upd.field_name);
+        if (upd.user_skipped) {
+          newExtracted[upd.field_name] = {
+            ...newExtracted[upd.field_name],
+            value: null,
+            status: 'missing',
+            needs_confirmation: false,
+            user_skipped: true,
+            source: 'unknown',
+            explanation: upd.notes || 'Founder indicated undecided or skipped.',
+          };
+        } else if (typeof upd.value === 'string' && upd.value.trim().length > 0 && upd.value.trim().toLowerCase() !== 'null') {
+          const st: FieldExtractionStatus =
+            upd.status === 'inferred' || upd.status === 'ambiguous' ? upd.status : 'explicit';
+          newExtracted[upd.field_name] = {
+            ...newExtracted[upd.field_name],
+            value: upd.value.trim(),
+            status: st,
+            evidence:
+              upd.evidence && String(upd.evidence).trim().toLowerCase() !== 'null'
+                ? String(upd.evidence).trim()
+                : userMessage.trim(),
+            confidence: st === 'explicit' ? 0.96 : 0.78,
+            needs_confirmation: st !== 'explicit',
+            user_skipped: false,
+            source: 'interview',
+            explanation: upd.notes || undefined,
+          };
+        }
+      }
+    }
+
+    const updatedAnswered = Array.from(newlyHandledFields);
+    const questionHistory = history.filter((m) => m.role === 'assistant').map((m) => m.content);
+
+    // Deterministic Question-Relevance Safety Check (Rules A–F)
+    let finalNextQ: {
+      question: string;
+      targetField: string;
+      suggestedAnswers: string[];
+      isComplete: boolean;
+    };
+
+    if (parsed.isInterviewComplete || parsed.nextQuestion === 'INTERVIEW_COMPLETE') {
+      finalNextQ = {
+        question: 'INTERVIEW_COMPLETE',
+        targetField: 'complete',
+        suggestedAnswers: ['Proceed to Profile Review', 'Review Extracted Evidence'],
+        isComplete: true,
+      };
+    } else {
+      const candidateTarget = parsed.nextTargetField || '';
+      const candidateQuestion = (parsed.nextQuestion || '').trim();
+      const validation =
+        candidateTarget && candidateQuestion && newExtracted[candidateTarget]
+          ? validateQuestionRelevance(
+              candidateQuestion,
+              candidateTarget,
+              rawIdea,
+              newExtracted,
+              questionHistory,
+              updatedAnswered
+            )
+          : { isValid: false };
+
+      if (validation.isValid) {
+        const opts = Array.isArray(parsed.suggestedAnswers)
+          ? parsed.suggestedAnswers.filter((s: unknown) => typeof s === 'string' && s.trim().length > 0).slice(0, 4)
+          : [];
+        finalNextQ = {
+          question: candidateQuestion,
+          targetField: candidateTarget,
+          suggestedAnswers:
+            opts.length > 0
+              ? opts
+              : ['I have a specific answer to share', "I haven't decided yet", 'Skip this question'],
+          isComplete: false,
+        };
+      } else {
+        finalNextQ = generatePrioritizedQuestion(rawIdea, newExtracted, questionHistory, updatedAnswered);
+      }
+    }
+
+    return {
+      updatedExtracted: newExtracted,
+      updatedAnswered,
+      answerAnalysis: (parsed.answerAnalysis || '').trim(),
+      nextQuestion: finalNextQ,
+    };
+  } catch (err) {
+    console.warn('Gemini interview step analysis failed, falling back to deterministic engine:', err);
+    return null;
+  }
+}
+
+/**
  * High-level orchestration for Step 3, 4, 5 & Rules A-F:
- * Updates profile with the user's answer, checks for skipped/unknown,
- * re-evaluates unanswered fields, validates question relevance,
- * and generates the next focused question.
+ * Updates profile with the user's answer (via Gemini when available, or deterministic fallback),
+ * checks for skipped/unknown, re-evaluates unanswered fields, validates question relevance,
+ * and generates the next focused, idea-specific question.
  */
 export async function handleInterviewStep(
   rawIdea: string,
@@ -1389,6 +1779,7 @@ export async function handleInterviewStep(
   extractedProfile: ExtractedStartupProfile;
   answeredFields: string[];
   readiness: ReadinessGate;
+  targetField: string;
   suggestedAnswers: string[];
   isComplete: boolean;
 }> {
@@ -1408,29 +1799,77 @@ export async function handleInterviewStep(
 
   let targetField = targetFieldHint || '';
   if (!targetField) {
-    if (lastPrompt.includes('target customer') || lastPrompt.includes('who is the primary') || lastPrompt.includes('persona')) {
+    if (lastPrompt.includes('target customer') || lastPrompt.includes('who is the primary') || lastPrompt.includes('paying customer') || lastPrompt.includes('persona')) {
       targetField = 'primary_customer';
-    } else if (lastPrompt.includes('country') || lastPrompt.includes('city') || lastPrompt.includes('initial market') || lastPrompt.includes('launch in first')) {
+    } else if (lastPrompt.includes('country') || lastPrompt.includes('city') || lastPrompt.includes('initial market') || lastPrompt.includes('launch in') || lastPrompt.includes('geography')) {
       targetField = 'geography';
-    } else if (lastPrompt.includes('problem') || lastPrompt.includes('friction') || lastPrompt.includes('acute')) {
+    } else if (lastPrompt.includes('problem') || lastPrompt.includes('friction') || lastPrompt.includes('pain')) {
       targetField = 'problem';
     } else if (lastPrompt.includes('how will your product') || lastPrompt.includes('solution') || lastPrompt.includes('how does it work')) {
       targetField = 'proposed_solution';
-    } else if (lastPrompt.includes('monetize') || lastPrompt.includes('revenue') || lastPrompt.includes('pricing')) {
+    } else if (lastPrompt.includes('pricing') || lastPrompt.includes('price point')) {
+      targetField = 'pricing';
+    } else if (lastPrompt.includes('monetize') || lastPrompt.includes('revenue') || lastPrompt.includes('business model')) {
       targetField = 'revenue_streams';
     } else if (lastPrompt.includes('competitor') || lastPrompt.includes('alternatives') || lastPrompt.includes('workaround')) {
       targetField = 'direct_competitors';
-    } else if (lastPrompt.includes('advantage') || lastPrompt.includes('differenti') || lastPrompt.includes('moat')) {
+    } else if (lastPrompt.includes('advantage') || lastPrompt.includes('differenti') || lastPrompt.includes('moat') || lastPrompt.includes('value proposition')) {
       targetField = 'competitive_advantage';
     } else {
-      // Default to first unanswered priority field
       const nextCandidate = REQUIRED_23_FIELDS.find((f) => !workingAnswered.includes(f.name) && workingExtracted![f.name]?.status !== 'explicit');
       targetField = nextCandidate?.name || 'startup_idea';
     }
   }
 
-  const questionHistory = history.filter((m) => m.role === 'assistant').map((m) => m.content);
+  // Try Gemini-powered answer segregation & tailored follow-up first
+  const geminiResult = await processInterviewStepWithGemini(
+    rawIdea,
+    userMessage,
+    history,
+    workingExtracted,
+    workingAnswered,
+    targetField
+  );
 
+  if (geminiResult) {
+    const canonicalLock = buildCanonicalLockFromExtracted(
+      rawIdea,
+      geminiResult.updatedExtracted,
+      currentProfile.businessIdentityLock?.flaggedAmbiguities || []
+    );
+    if (currentProfile.businessIdentityLock?.canonicalProductName && currentProfile.businessIdentityLock.canonicalProductName !== 'Untitled Venture') {
+      canonicalLock.canonicalProductName = currentProfile.businessIdentityLock.canonicalProductName;
+    }
+    const updatedStartupProfile = syncExtractedToStartupProfile(
+      rawIdea,
+      geminiResult.updatedExtracted,
+      canonicalLock,
+      currentProfile
+    );
+    const readiness = calculateReadinessFromExtracted(geminiResult.updatedExtracted);
+    const nextQ = geminiResult.nextQuestion;
+
+    let replyText = geminiResult.answerAnalysis ? `${geminiResult.answerAnalysis}\n\n` : '';
+    if (nextQ.isComplete) {
+      replyText += `🎯 **Interview Complete**: All essential dimensions have been verified. Your startup profile is ready for review. Click **"Proceed to Profile Gate"** to launch deep research!`;
+    } else {
+      replyText += `**Next Question**: ${nextQ.question}`;
+    }
+
+    return {
+      reply: replyText,
+      updatedProfile: updatedStartupProfile,
+      extractedProfile: geminiResult.updatedExtracted,
+      answeredFields: geminiResult.updatedAnswered,
+      readiness,
+      targetField: nextQ.targetField,
+      suggestedAnswers: nextQ.suggestedAnswers,
+      isComplete: nextQ.isComplete,
+    };
+  }
+
+  // Deterministic Fallback Path
+  const questionHistory = history.filter((m) => m.role === 'assistant').map((m) => m.content);
   const stepResult = updateProfileWithUserAnswer(
     rawIdea,
     workingExtracted,
@@ -1443,7 +1882,6 @@ export async function handleInterviewStep(
 
   const readiness = calculateReadinessFromExtracted(stepResult.updatedExtractedProfile);
   const nextQ = stepResult.nextQuestion;
-
   const targetLabel = REQUIRED_23_FIELDS.find((f) => f.name === targetField)?.label || targetField;
 
   let replyText = '';
@@ -1473,6 +1911,7 @@ export async function handleInterviewStep(
     extractedProfile: stepResult.updatedExtractedProfile,
     answeredFields: stepResult.updatedAnsweredFields,
     readiness,
+    targetField: nextQ.targetField,
     suggestedAnswers: nextQ.suggestedAnswers,
     isComplete: nextQ.isComplete,
   };

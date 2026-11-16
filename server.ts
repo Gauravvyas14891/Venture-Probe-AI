@@ -267,6 +267,9 @@ app.get('/api/benchmarks/:id', async (req, res) => {
   return res.json({ profile: dummyProfile, report: auditedReport });
 });
 
+// Serve generated documentation PDFs directly with proper MIME type
+app.use('/docs', express.static(path.resolve('public/docs')));
+
 // Vite middleware or static serving
 async function startServer() {
   const isProd = process.env.NODE_ENV === 'production';

@@ -307,14 +307,14 @@ Return a STRICT JSON matching this schema:
 }`;
 
       const generatePromise = ai.models.generateContent({
-        model: 'gemini-3.8-flash',
+        model: 'gemini-4-hydrogen',
         contents: lockPrompt,
         config: {
           responseMimeType: 'application/json',
         },
       });
 
-      const response = await withTimeout(generatePromise, 4000);
+      const response = await withTimeout(generatePromise, 15000);
       const text = response.text?.trim() || '{}';
       const parsed = JSON.parse(text);
 
@@ -665,15 +665,14 @@ Evaluate the response, update the profile fields while strictly preserving the l
 }`;
 
       const generatePromise = ai.models.generateContent({
-        model: 'gemini-3.8-flash',
+        model: 'gemini-4-hydrogen',
         contents: prompt,
         config: {
           responseMimeType: 'application/json',
         },
       });
 
-      // Snappy 3.5s timeout prevents user interface stalls
-      const response = await withTimeout(generatePromise, 3500);
+      const response = await withTimeout(generatePromise, 15000);
       const text = response.text?.trim() || '{}';
       const parsed = JSON.parse(text);
 
@@ -1235,14 +1234,14 @@ The final report may use only findings supported by this dataset.
 Format the output as a strict JSON matching the ResearchReport schema (mode: "${mode}").`;
 
       const generatePromise = ai.models.generateContent({
-        model: 'gemini-3.8-flash',
+        model: 'gemini-4-hydrogen',
         contents: searchPrompt,
         config: {
           tools: [{ googleSearch: {} }],
         },
       });
 
-      const response = (await withTimeout(generatePromise, 8000)) as any;
+      const response = (await withTimeout(generatePromise, 25000)) as any;
 
       const responseText = response.text || '';
       const groundingChunks = response.candidates?.[0]?.groundingMetadata?.groundingChunks || [];
@@ -2971,11 +2970,11 @@ Return a strict JSON object with:
 }`;
 
     const generatePromise = ai.models.generateContent({
-      model: 'gemini-3.8-flash',
+      model: 'gemini-4-hydrogen',
       contents: auditPrompt,
     });
 
-    const response = (await withTimeout(generatePromise, 6000)) as any;
+    const response = (await withTimeout(generatePromise, 20000)) as any;
     const responseText = response.text || '';
     const jsonMatch = responseText.match(/\{[\s\S]*\}/);
     if (jsonMatch) {

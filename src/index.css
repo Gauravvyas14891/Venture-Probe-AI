@@ -1,7 +1,50 @@
 @import "tailwindcss";
 
+@theme {
+  --font-sans: "Host Grotesk", system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+}
+
+:root {
+  --vp-page-ground: #f1f3e6;
+  --vp-alt-ground: #e9eade;
+  --vp-text-primary: #000000;
+  --vp-text-secondary: #333333;
+  --vp-text-muted: #4d4c4c;
+  --vp-inverse-ground: #141314;
+  --vp-inverse-text: #fcfcfd;
+  --vp-accent: #3f6212;
+  --vp-accent-hover: #365314;
+  --vp-hairline: #d3d4c8;
+}
+
+html {
+  scroll-behavior: smooth;
+  font-family: "Host Grotesk", system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  background-color: #f1f3e6;
+  color: #000000;
+}
+
+body {
+  font-family: "Host Grotesk", system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  background-color: #f1f3e6;
+  color: #000000;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  html {
+    scroll-behavior: auto;
+  }
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}
+
 @media print {
-  /* Reset page for clean crisp white-paper printing */
   @page {
     size: A4 portrait;
     margin: 14mm 12mm 14mm 12mm;
@@ -16,7 +59,6 @@
     print-color-adjust: exact !important;
   }
 
-  /* Hide interactive navigation, action bars, modals backdrop, and tabs */
   nav,
   header,
   .no-print,
@@ -25,19 +67,16 @@
     display: none !important;
   }
 
-  /* Expand print-only elements */
   .print-only {
     display: block !important;
   }
 
-  /* Container adjustments */
   .mx-auto {
     max-width: 100% !important;
     padding: 0 !important;
     margin: 0 !important;
   }
 
-  /* Make dark slate cards high-contrast print white with crisp borders */
   section,
   div[class*="bg-slate-900"],
   div[class*="bg-slate-950"],
@@ -50,7 +89,6 @@
     page-break-inside: avoid;
   }
 
-  /* Typography adjustments for print readability */
   h1, h2, h3, h4, h5, h6 {
     color: #0f172a !important;
     break-after: avoid;
@@ -61,7 +99,6 @@
     color: #1e293b !important;
   }
 
-  /* Display links cleanly with their destination */
   a {
     color: #2563eb !important;
     text-decoration: underline !important;
@@ -73,7 +110,6 @@
     color: #64748b;
   }
 
-  /* Clean table borders */
   table {
     border-collapse: collapse !important;
     width: 100% !important;
@@ -89,7 +125,6 @@
     background-color: #f8fafc !important;
   }
 
-  /* Badges */
   span[class*="rounded"] {
     border: 1px solid #94a3b8 !important;
     color: #0f172a !important;
